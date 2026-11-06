@@ -1,0 +1,117 @@
+"""
+IBM Cloud Object Storage service.
+
+Handles:
+  - Uploading research PDFs
+  - Uploading generated reports
+  - Generating presigned download URLs
+"""
+import logging
+from typing import Optional
+
+from app.core.config import settings
+
+logger = logging.getLogger(__name__)
+
+
+class COSService:
+    """Wraps ibm-cos-sdk for research file storage."""
+
+    def __init__(self):
+        self._client = None
+
+    def _get_client(self):
+        if self._client is not None:
+            return self._client
+        if not settings.has_cos:
+            return None
+        try:
+            import ibm_boto3
+            from ibm_botocore.client import Config
+
+            self._client = ibm_boto3.client(
+                "s3",
+                ibm_api_key_id=settings.COS_API_KEY,
+                ibm_service_instance_id=settings.COS_INSTANCE_CRN,
+                config=Config(signature_version="oauth"),
+                endpoint_url=settings.COS_ENDPOINT,
+            )
+            logger.info("IBM COS client initialized")
+            return self._client
+        except Exception as exc:
+            logger.warning("Could not initialize COS client: %s", exc)
+            return None
+
+    def _ensure_bucket(self, bucket: str):
+        """Create bucket if it doesn't exist."""
+        client = self._get_client()
+        if not client:
+            return
+        try:
+            client.head_bucket(Bucket=bucket)
+        except Exception:
+            try:
+                client.create_bucket(Bucket=bucket)
+                logger.info("Created COS bucket: %s", bucket)
+            except Exception as exc:
+                logger.warning("Could not create bucket %s: %s", bucket, exc)
+
+    def upload_pdf(self, file_bytes: bytes, filename: str, user_id: str) -> Optional[str]:
+        """Upload a PDF to COS and return the object key."""
+        client = self._get_client()
+        if not client:
+            logger.info("COS not configured – PDF stored locally/in-memory")
+            return f"local/{user_id}/{filename}"
+        self._ensure_bucket(settings.COS_BUCKET_PDFS)
+        key = f"{user_id}/pdfs/{filename}"
+        try:
+            client.put_object(
+                Bucket=settings.COS_BUCKET_PDFS,
+                Key=key,
+                Body=file_bytes,
+                ContentType="application/pdf",
+            )
+            logger.info("Uploaded PDF to COS: %s", key)
+            return key
+        except Exception as exc:
+            logger.error("COS upload error: %s", exc)
+            return None
+
+    def upload_report(self, content: str, filename: str, user_id: str) -> Optional[str]:
+        """Upload a generated report to COS."""
+        client = self._get_client()
+        if not client:
+            return f"local/{user_id}/reports/{filename}"
+        self._ensure_bucket(settings.COS_BUCKET_REPORTS)
+        key = f"{user_id}/reports/{filename}"
+        try:
+            client.put_object(
+                Bucket=settings.COS_BUCKET_REPORTS,
+                Key=key,
+                Body=content.encode("utf-8"),
+                ContentType="text/markdown",
+            )
+            return key
+        except Exception as exc:
+            logger.error("COS report upload error: %s", exc)
+            return None
+
+    def get_download_url(self, bucket: str, key: str, expiry: int = 3600) -> Optional[str]:
+        """Generate a presigned download URL."""
+        client = self._get_client()
+        if not client:
+            return None
+        try:
+            url = client.generate_presigned_url(
+                "get_object",
+                Params={"Bucket": bucket, "Key": key},
+                ExpiresIn=expiry,
+            )
+            return url
+        except Exception as exc:
+            logger.warning("Could not generate presigned URL: %s", exc)
+            return None
+
+
+# Singleton
+cos_service = COSService()
